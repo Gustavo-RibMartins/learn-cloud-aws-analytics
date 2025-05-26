@@ -205,16 +205,232 @@ Apache spark, Kafka Connect, etc.
 
 ### Kinesis Fireshose
 
+* Serviço gerenciado pela AWS
+* Near Real Time (Buffer baseado em tempo e tamanho)
+* Carrega dados no Redshift, S3, OpenSearch, Splunk
+* Escalonamento automático
+* Suporta muitos formatos de dados
+* Conversão de dados de JSON para Parquet/ORC (apenas para S3)
+* Transformação de dados através de Lambda Function (ex.: CSV => JSON)
+* Suporta compressão quando o destino é o S3 (GZIP, ZIP e Snappy)
+* Para compressão com Redshift suporta apenas GZIP
+* Pague pela quantidade de dados que passa pelo Firehose
+* Spark / KCL `NÃO` conseguem ler do Kinesis Data Firehose
+
+![](./imagens/firehose.png)
+
+**Firehose Buffer Sizing**
+
+* Firehose acumula records em um buffer
+* O Buffer é baseado em time ou size rules
+* Firehose pode automaticamente aumentar o buffer size para aumentar o throughput
+
+
 ---
 
 ### AWS Lambda
 
 O Lambda pode ler records do Kinesis Data Stream. Também possui uma pequena biblioteca para desagregar records do KPL.
 
-Também pode ser usado para fazer um ETL leve e enviar os dados ao S3, DynamiDB, Redshift, OpenSearch, etc.
+Também pode ser usado para fazer um ETL leve e enviar os dados ao S3, DynamoDB, Redshift, OpenSearch, etc.
 
 Lambda também tem um batch size configurável.
 
 ---
 
 ### Kinesis Consumer Enhanced Fan-Out
+
+Funciona com KCL 2.0 e AWS Lambda.
+
+Cada consumer possui 2 MB/s provisionado de througput por shard, o que significa que 20 consumers terão 40 MB/s por shard agregado.
+
+**Standard Consumer:**
+
+* Baixo número de aplicações consumidores (1, 2, 3,...)
+* Pode tolerar latência de aproximadamente 200 ms
+* Minimiza o custo
+
+**Enhanced Fan Out Consumer:**
+
+* Múltiplas aplicações consumidores para o mesmo stream
+* Baixa latência de aproximadamente 70 ms
+* Alto custo
+* Default limit de 20 consumers usando enhanced fan-out por shard
+
+---
+
+## Kinesis Operations
+
+### Adding Shards
+
+Também chamado de `shard splitting`. Pode ser usado para aumetar a capacidade do stream (1 MB/s data in por shard).
+
+Pode ser usado para dividir um "hot shard".
+
+![](./imagens/add.png)
+
+---
+
+### Merging Shards
+
+Diminui a capacidade do stream, reduzindo o custo.
+
+Pode ser usado para agrupar dois shards com baixo tráfego.
+
+![](./imagens/merge.png)
+
+---
+
+### Registros fora de ordem após resharding
+
+Após o reshard (add ou merge), você pode ler a partir dos child shards.
+
+Entretanto, dados que você ainda não leu ainda podem estar no parent shard.
+
+![](./imagens/resharding.png)
+
+Se você começar a ler do child shard antes de completar as leituras do parent shard, `você poderá ler dados de um hash key particular fora de ordem`.
+
+Após um reshard, leia totalmente os records do parent shard até não ter mais novos registros nele.
+
+> **Obs.:** O KCL tem essa lógica embutida.
+
+---
+
+### Auto Scaling
+
+Não é uma feature nativa do Kinesis. A API call usada para mudar o número de shards é `UpdateShardCount`.
+
+Podemos implementar auto scaling com AWS Lambda.
+
+![](./imagens/scaling.png)
+
+**Limites**
+
+* Resharding não pode ser feito em paralelo
+* Você pode fazer um resharding por vez e ele pode levar alguns segundos
+* Para 1.000 shards, leva cerca de 30.000 s (8.3 h) para dobrar os shards para 2.000
+
+---
+
+### Duplicatas (from Producers)
+
+* Producer retries podem criar duplicatas devido a timeouts de rede
+* Embora os dois registros tenham dados identicos, eles possuem key numbers exclusivos
+* Fix: faça o `embeed do record ID único` nos dados para de-duplicar do lado do consumer
+
+![](./imagens/duplicates.png)
+
+---
+
+### Duplicatas (from Consumer)
+
+* Consumer retries podem fazer sua aplicação ler o mesmo dado duas vezes
+* Consumer retries acontecem quando o processador de registros reestarta:
+    * Um worker é terminado inesperadamente
+    * Worker instances são adicionadas ou removidas
+    * Shards passam por merge ou split
+    * A aplicação é deployada
+
+* Fix:
+    * Faça sua aplicação consumidora idenpotente
+    * Se o destino final puder lidar com duplicatas, é recomendado tratar lá
+
+---
+
+## Troubleshooting: Producers
+
+**Escrita muito lenta**
+
+* Exceção de limites de serviço. Check thoughput exceptions
+* Existem limites a nivel de shard para escritas e leituras
+* Outras operações (CreateStream, ListStream, DescribeStream) tem limites de 5-20 calls/ s
+
+**Large Producers**
+
+* Batch. Use KPL. PutRecords com multi-records, ou aggregate records em arquivos grandes
+
+**Small Producers**
+
+* Utilize PutRecords ou Kineses Recorder no AWS Mobile SDKs
+
+**Stream retorna erro 500 ou 503**
+
+* Indica um erro `AmazonKinesisException` menor que 1%
+* Implemente um mecanismo de retry
+
+**Erro de conexão do Flink para o Kinesis**
+
+* Network issues ou problema nos recursos do ambiente do Flink
+* Pode ser um erro de configuração na VPC
+
+**Erros de timeout do Flink para o Kinesis**
+
+* Ajuste o `RequestTimeout` e `#setQueueLimit` no FlinkKinesisProducer
+
+**Throttilng**
+
+* Verifique a existência de hot shards com enhanced monitoring (shard-level)
+* Verifique logs para "micro spikes"
+* Tente um rando partition key ou melhore a distribuição de keys
+* Use exponential backoff
+* Rate limit
+
+---
+
+## Troubleshooting: Consumers
+
+**Records skipped com KCL**
+
+* Verifique unhandled exceptions no processRecords
+
+**Records no mesmo shard processados mais de uma vez**
+
+* Ajuste o failover limit
+
+**Leituras muito lentas**
+
+* Aumente o número de shards
+* maxRecords por chamada está muito lento
+* O seu código é muito lento
+
+**GetRecords retornando resultados nulos**
+
+* Isto é normal, apenas continue chamado GetRecords
+
+**Shared Iterator expires**
+
+* Precisa de mais capacidade de escrita na shard table do DynamoDB
+
+**Falha no Recrod Processing**
+
+* Aumente o retention period
+* Usualmente, recursos insuficientes
+
+**ReadProvisionedThroughputExceeded exception**
+
+* Thorttling
+* Reshard o seu stream
+* Reduza o tamanho de GetRecords requests
+* Use enhanced fan-out
+* Use retries e exponential backoff
+
+**Alta latência**
+
+* Monitore com `GetRecords.Latency` e `IteratorAge`
+* Aumente a quantidade de shards
+* Aumente o preíodo de retenção
+* Verifique o uso de CPU e memória
+
+**Erros 500**
+
+* O mesmo que para Producer - taxa de erro < 1%
+* Implemente um mecanismo de retry
+
+**Blocked os Stuck KCL Application**
+
+* Otimize o seu método de `processRecords`
+* Aumente maxLeasesPerWorker
+* Habilite KCL debug logs
+
+---
