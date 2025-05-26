@@ -7,3 +7,4 @@ Repositório para estudo de serviços de Analytics da AWS
 * [Kinesis Data Stream](./kinesis_data_stream/)
 * [Amazon Athena](./athena/)
 * [EMR](./emr/)
+* [Kinesis Data Analytics/ Managed Service for Apache Flink](./kinesis_data_analytics/)
